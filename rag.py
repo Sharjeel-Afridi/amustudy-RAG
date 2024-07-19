@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import warnings
 import pickle
 from flask import Flask, request, jsonify, redirect, url_for, send_from_directory
@@ -18,7 +19,7 @@ load_dotenv()
 warnings.filterwarnings("ignore")
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['UPLOAD_FOLDER'] = 'documents'
 CORS(app)
 
 # PocketBase setup
@@ -30,6 +31,9 @@ model = ChatGoogleGenerativeAI(
     temperature=0.2,
     convert_system_message_to_human=True
 )
+
+
+
 
 def process_pdf(file_path, file_id):
     global vector_index
@@ -47,14 +51,24 @@ def process_pdf(file_path, file_id):
 
     vector_index = Chroma.from_texts(texts, embeddings).as_retriever(search_kwargs={"k": 6})
     
-    # Serialize vector index
-    vector_index_bytes = pickle.dumps(vector_index)
-    
+    # Extract data from vector index
+    index_data = {
+        'texts': texts,  # This should be serialized to a format that can be saved and restored
+        # 'embeddings': embeddings.__dict__,  # Save relevant attributes if needed
+        'context': context,
+    }
+
+    # Convert to JSON-serializable format
+    index_data_json = {
+        'texts': index_data['texts'],
+        'context': index_data['context'],
+    }
+
     # Save to PocketBase
     record = {
-        "id": file_id,
-        "context": context,
-        "vector_index": vector_index_bytes
+        # "id": file_id,
+        # "context": context,
+        "vector_index": index_data_json
     }
     pb.collection("pdfs").create(record)
 
@@ -67,62 +81,17 @@ def load_pdf_data(file_id):
         return vector_index, context
     return None, None
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    if 'file' not in request.files:
-        return redirect(request.url)
-    file = request.files['file']
-    if file.filename == '':
-        return redirect(request.url)
-    if file:
-        file_name = secure_filename(file.filename)
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], file_name)
-        file_id = file_name  # Use the file name as the ID
-        file.save(file_path)
-        process_pdf(file_path, file_id)
-        return jsonify({"filePath": secure_filename(file.filename)})
-    return redirect(request.url)
 
-@app.route('/uploads/<filename>')
-def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+def process_all_pdfs():
+    for filename in os.listdir(app.config['UPLOAD_FOLDER']):
+        if filename.endswith('.pdf'):
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file_id = Path(filename).stem  # Use the file name without extension as the ID
+            process_pdf(file_path, file_id)
 
-@app.route('/ask', methods=['POST'])
-def ask():
-    global vector_index, model
-    data = request.get_json()
-    question = data.get('question', '')
-    file_id = data.get('file_id', '')
-
-    if not file_id:
-        return jsonify({"response": "No file ID provided."}), 400
-    
-    if vector_index is None or vector_index.retriever.id != file_id:
-        vector_index, context = load_pdf_data(file_id)
-    
-    if vector_index is None:
-        return jsonify({"response": "No PDF file uploaded or processed for this ID."}), 400
-
-    template = """Use the following pieces of context to answer the question but if I ask something else related to this then also answer that. Always be kind after responding.
-    {context}
-    Question: {question}
-    Helpful Answer:"""
-    
-    QA_CHAIN_PROMPT = PromptTemplate.from_template(template)
-    qa_chain = RetrievalQA.from_chain_type(
-        model,
-        retriever=vector_index,
-        return_source_documents=True,
-        chain_type_kwargs={"prompt": QA_CHAIN_PROMPT}
-    )
-
-    if not question:
-        return jsonify({"response": "No question provided."}), 400
-
-    result = qa_chain({"query": question})
-    return result["result"]
 
 if __name__ == "__main__":
-    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+    # os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+    process_all_pdfs()  
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
